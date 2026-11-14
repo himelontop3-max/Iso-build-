@@ -1,3 +1,4 @@
+
 name: Build VRON OS v2.0 ISO
 
 on:
@@ -25,30 +26,36 @@ jobs:
         run: |
           python -m pip install --upgrade gdown
 
-      - name: Download Windows ISO
+      - name: Download Windows 10 IoT Enterprise LTSC 2021
         shell: pwsh
         run: |
           $iso = "$env:RUNNER_TEMP\windows.iso"
-          # Archive.org থেকে উইন্ডোজ ১০ আইওটি এন্টারপ্রাইজ এলটিএসসি ২০২১ এর ডিরেক্ট লিংক
+
           $url = "https://archive.org/download/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso"
 
-          curl.exe -L --retry 5 --retry-delay 5 -o $iso $url
+          Remove-Item $iso -Force -ErrorAction SilentlyContinue
+
+          curl.exe -fL --retry 5 --retry-delay 5 `
+            --connect-timeout 60 `
+            -o $iso $url
 
           if ($LASTEXITCODE -ne 0 -or !(Test-Path $iso)) {
             throw "Windows ISO download failed."
           }
 
           $size = (Get-Item $iso).Length
-          Write-Host "Windows ISO size: $size bytes"
+          $gb = [math]::Round($size / 1GB, 2)
+
+          Write-Host "Windows ISO downloaded: $gb GB"
 
           if ($size -lt 4000000000) {
-            throw "Incomplete Windows ISO download."
+            throw "Windows ISO is incomplete."
           }
 
-      - name: Download VRON application
+      - name: Download VRON application ZIP
         shell: pwsh
         run: |
-          $id = "1bYtfxs2lmqWkOKQEwDPmyMd_huAmXCIF"
+          $id = "1ytJHTL52L05yKz62sWn9yM8zksOkT8em"
           $zip = "$env:RUNNER_TEMP\vron.zip"
 
           python -m gdown $id -O $zip --retries 5 --timeout 120
@@ -57,8 +64,19 @@ jobs:
             throw "VRON ZIP download failed."
           }
 
-          if ((Get-Item $zip).Length -lt 1000000) {
-            throw "VRON ZIP appears incomplete."
+          $size = (Get-Item $zip).Length
+
+          Write-Host "VRON ZIP size: $size bytes"
+
+          if ($size -lt 1000000) {
+            throw "VRON ZIP is incomplete."
+          }
+
+      - name: Verify extraction tools
+        shell: pwsh
+        run: |
+          if (!(Get-Command 7z -ErrorAction SilentlyContinue)) {
+            throw "7-Zip is not available."
           }
 
       - name: Extract Windows ISO
@@ -84,11 +102,15 @@ jobs:
 
           foreach ($file in $required) {
             if (!(Test-Path $file)) {
-              throw "Missing Windows ISO file: $file"
+              throw "Missing required file: $file"
             }
           }
 
-      - name: Extract and install VRON files
+          Write-Host "Windows installation media verified."
+
+          Remove-Item $iso -Force
+
+      - name: Extract and install VRON
         shell: pwsh
         run: |
           $zip = "$env:RUNNER_TEMP\vron.zip"
@@ -109,6 +131,8 @@ jobs:
             throw "VRON.Shell.exe not found."
           }
 
+          Write-Host "Found VRON: $($exe.FullName)"
+
           $target = "C:\VRONBuild\ISO\sources\`$OEM$\`$1\VRON"
 
           New-Item -ItemType Directory -Force -Path $target | Out-Null
@@ -119,6 +143,10 @@ jobs:
             throw "VRON installation copy failed."
           }
 
+          Write-Host "VRON application copied successfully."
+
+          Remove-Item $zip -Force
+
       - name: Create SetupComplete script
         shell: pwsh
         run: |
@@ -126,28 +154,43 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
-          Set-Content -Path "$dir\SetupComplete.cmd" -Value '@echo off' -Encoding ASCII
-          Add-Content -Path "$dir\SetupComplete.cmd" -Value 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "VRON" /t REG_SZ /d "C:\VRON\VRON.Shell.exe" /f' -Encoding ASCII
-          Add-Content -Path "$dir\SetupComplete.cmd" -Value 'exit /b 0' -Encoding ASCII
+          @'
+          @echo off
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "VRON" /t REG_SZ /d "C:\VRON\VRON.Shell.exe" /f
+          exit /b 0
+          '@ | Set-Content "$dir\SetupComplete.cmd" -Encoding ASCII
 
-      - name: Install Windows ADK
+          Write-Host "SetupComplete script created."
+
+      - name: Install Windows ADK Deployment Tools
         shell: pwsh
         run: |
-          $url = "https://go.microsoft.com/fwlink/?linkid=2271337"
           $installer = "$env:RUNNER_TEMP\adksetup.exe"
+          $url = "https://go.microsoft.com/fwlink/?linkid=2271337"
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
-          Start-Process $installer -ArgumentList "/quiet", "/norestart", "/features", "OptionId.DeploymentTools" -Wait
+          $process = Start-Process $installer `
+            -ArgumentList "/quiet", "/norestart", "/features", "OptionId.DeploymentTools" `
+            -Wait -PassThru
 
-          $oscdimg = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools" -Filter oscdimg.exe -Recurse |
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Windows ADK installation failed: $($process.ExitCode)"
+          }
+
+          $oscdimg = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools" `
+            -Filter oscdimg.exe -Recurse |
             Select-Object -First 1
 
           if (!$oscdimg) {
             throw "oscdimg.exe not found."
           }
 
-          "OSCDIMG=$($oscdimg.FullName)" | Out-File $env:GITHUB_ENV -Append
+          "OSCDIMG=$($oscdimg.FullName)" |
+            Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "Windows ADK ready."
 
       - name: Build bootable VRON ISO
         shell: pwsh
@@ -159,13 +202,19 @@ jobs:
             "-bootdata:2#p0,e,b$source\boot\etfsboot.com#pEF,e,b$source\efi\microsoft\boot\efisys.bin" `
             $source $output
 
-          if ($LASTEXITCODE -ne 0 -or !(Test-Path $output)) {
-            throw "VRON ISO build failed."
+          if ($LASTEXITCODE -ne 0) {
+            throw "OSCDIMG failed: $LASTEXITCODE"
           }
 
-          Write-Host "VRON ISO successfully created!"
+          if (!(Test-Path $output)) {
+            throw "Final ISO was not created."
+          }
 
-      - name: Upload final ISO
+          $size = [math]::Round((Get-Item $output).Length / 1GB, 2)
+
+          Write-Host "VRON ISO CREATED: $size GB"
+
+      - name: Upload final VRON ISO
         uses: actions/upload-artifact@v4
         with:
           name: VRON-OS-v2.0-LTSC2021
