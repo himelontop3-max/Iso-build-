@@ -1,4 +1,3 @@
-
 name: Build VRON OS v2.0 ISO
 
 on:
@@ -29,10 +28,11 @@ jobs:
       - name: Download Windows ISO
         shell: pwsh
         run: |
-          $id = "1ytJHTL52L05yKz62sWn9yM8zksOkT8em"
           $iso = "$env:RUNNER_TEMP\windows.iso"
+          # Archive.org থেকে উইন্ডোজ ১০ আইওটি এন্টারপ্রাইজ এলটিএসসি ২০২১ এর ডিরেক্ট লিংক
+          $url = "https://archive.org/download/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso"
 
-          python -m gdown $id -O $iso --retries 5 --timeout 120
+          curl.exe -L --retry 5 --retry-delay 5 -o $iso $url
 
           if ($LASTEXITCODE -ne 0 -or !(Test-Path $iso)) {
             throw "Windows ISO download failed."
@@ -126,11 +126,9 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
-          @'
-          @echo off
-          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "VRON" /t REG_SZ /d "C:\VRON\VRON.Shell.exe" /f
-          exit /b 0
-          '@ | Set-Content "$dir\SetupComplete.cmd" -Encoding ASCII
+          Set-Content -Path "$dir\SetupComplete.cmd" -Value '@echo off' -Encoding ASCII
+          Add-Content -Path "$dir\SetupComplete.cmd" -Value 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "VRON" /t REG_SZ /d "C:\VRON\VRON.Shell.exe" /f' -Encoding ASCII
+          Add-Content -Path "$dir\SetupComplete.cmd" -Value 'exit /b 0' -Encoding ASCII
 
       - name: Install Windows ADK
         shell: pwsh
