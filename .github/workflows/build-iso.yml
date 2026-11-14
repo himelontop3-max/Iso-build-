@@ -1,4 +1,5 @@
-name: VRON OS ISO Builder
+
+name: Build VRON OS Bootable ISO
 
 on:
   workflow_dispatch:
@@ -7,47 +8,153 @@ permissions:
   contents: read
 
 jobs:
-  prepare:
+  build:
     runs-on: windows-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Google Drive downloader
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade gdown
+
+      - name: Download Windows ISO
+        shell: pwsh
+        run: |
+          python -m gdown --fuzzy "https://drive.google.com/file/d/1ytJHTL52L05yKz62sWn9yM8zksOkT8em/view" -O "$env:RUNNER_TEMP\windows.iso"
+
+          if (!(Test-Path "$env:RUNNER_TEMP\windows.iso")) {
+            throw "Windows ISO download failed."
+          }
+
+          if ((Get-Item "$env:RUNNER_TEMP\windows.iso").Length -lt 1000000000) {
+            throw "Windows ISO appears incomplete or too small."
+          }
+
+      - name: Download VRON application
+        shell: pwsh
+        run: |
+          python -m gdown --fuzzy "https://drive.google.com/file/d/1bYtfxs2lmqWkOKQEwDPmyMd_huAmXCIF/view" -O "$env:RUNNER_TEMP\vron.zip"
+
+          if (!(Test-Path "$env:RUNNER_TEMP\vron.zip")) {
+            throw "VRON ZIP download failed."
+          }
+
+      - name: Install 7-Zip
+        shell: pwsh
+        run: |
+          choco install 7zip -y --no-progress
+
+      - name: Extract Windows ISO
+        shell: pwsh
+        run: |
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (!(Test-Path $sevenZip)) {
+            $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe"
+          }
+
+          if (!(Test-Path $sevenZip)) {
+            throw "7-Zip executable not found."
+          }
+
+          New-Item -ItemType Directory -Force C:\VRONBuild\ISO | Out-Null
+
+          & $sevenZip x "$env:RUNNER_TEMP\windows.iso" "-oC:\VRONBuild\ISO" -y
+
+          if (!(Test-Path "C:\VRONBuild\ISO\setup.exe")) {
+            throw "Windows ISO extraction failed."
+          }
+
+      - name: Extract VRON application
+        shell: pwsh
+        run: |
+          Expand-Archive "$env:RUNNER_TEMP\vron.zip" "$env:RUNNER_TEMP\vron" -Force
+
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\vron" -Filter "VRON.Shell.exe" -Recurse | Select-Object -First 1
+
+          if (!$exe) {
+            throw "VRON.Shell.exe not found in downloaded ZIP."
+          }
+
+          $destination = 'C:\VRONBuild\ISO\sources\$OEM$\$1\VRON'
+
+          New-Item -ItemType Directory -Force $destination | Out-Null
+
+          Get-ChildItem $exe.Directory.FullName -Force |
+            Copy-Item -Destination $destination -Recurse -Force
+
+      - name: Configure VRON startup
+        shell: pwsh
+        run: |
+          $scripts = 'C:\VRONBuild\ISO\sources\$OEM$\$$\Setup\Scripts'
+
+          New-Item -ItemType Directory -Force $scripts | Out-Null
+
+          @'
+          @echo off
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "VRON" /t REG_SZ /d "%SystemDrive%\VRON\VRON.Shell.exe" /f
+          exit /b 0
+          '@ | Set-Content "$scripts\SetupComplete.cmd" -Encoding ASCII
+
       - name: Install Windows ADK Deployment Tools
         shell: pwsh
         run: |
-          $url = "https://go.microsoft.com/fwlink/?linkid=2196127"
           $installer = "$env:TEMP\adksetup.exe"
 
-          Invoke-WebRequest $url -OutFile $installer
+          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2196127" -OutFile $installer
 
-          Start-Process $installer `
-            -ArgumentList "/quiet", "/features", "OptionId.DeploymentTools" `
-            -Wait
+          $process = Start-Process $installer -ArgumentList @(
+            "/quiet",
+            "/features",
+            "OptionId.DeploymentTools",
+            "/norestart"
+          ) -Wait -PassThru
 
-      - name: Verify Oscdimg
-        shell: pwsh
-        run: |
-          $oscdimg = "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe"
-
-          if (!(Test-Path $oscdimg)) {
-            throw "Oscdimg installation failed."
+          if ($process.ExitCode -ne 0) {
+            throw "Windows ADK installation failed: $($process.ExitCode)"
           }
 
-          Write-Host "Oscdimg ready."
-
-      - name: Prepare VRON ISO builder
+      - name: Create bootable VRON ISO
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force C:\VRONBuild
-          New-Item -ItemType Directory -Force C:\VRONBuild\ISO
+          $source = "C:\VRONBuild\ISO"
+          $output = "C:\VRONBuild\VRON-OS-v2.0-LTSC2021.iso"
 
-          Copy-Item scripts\build-vron-iso.ps1 C:\VRONBuild\
-          Copy-Item files\SetupComplete.cmd C:\VRONBuild\
+          $adk = "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe"
 
-      - name: Upload prepared builder
+          if (!(Test-Path $adk)) {
+            throw "Oscdimg not found."
+          }
+
+          if (!(Test-Path "$source\boot\etfsboot.com")) {
+            throw "BIOS boot file missing."
+          }
+
+          if (!(Test-Path "$source\efi\microsoft\boot\efisys.bin")) {
+            throw "UEFI boot file missing."
+          }
+
+          & $adk -m -o -u2 -udfver102 "-bootdata:2#p0,e,b$source\boot\etfsboot.com#pEF,e,b$source\efi\microsoft\boot\efisys.bin" $source $output
+
+          if (!(Test-Path $output)) {
+            throw "ISO creation failed."
+          }
+
+          Write-Host "VRON ISO CREATED SUCCESSFULLY!"
+
+      - name: Upload final VRON ISO
         uses: actions/upload-artifact@v4
         with:
-          name: VRON-ISO-Builder-Prepared
-          path: C:\VRONBuild\
+          name: VRON-OS-v2.0-LTSC2021
+          path: C:\VRONBuild\VRON-OS-v2.0-LTSC2021.iso
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
